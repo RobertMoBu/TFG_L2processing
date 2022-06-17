@@ -1,1 +1,319 @@
+% %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% --------------------------------------------------------
+% Created by isardSAT S.L.
+% --------------------------------------------------------
+% This script computes both the water level of the target 
+% and the geophysical corrections to be applied
+% ---------------------------------------------------------
+% Objective: Analize CR data
+% INPUTs : L1A
+%          L1B
+%		   L2 for geophysical corrections
+% ----------------------------------------------------------
+% Author:    Robert Molina / isardSAT
+% Last rev:  --    / isardSAT
+%
+% %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+close all;
+clear all;
 
+pass_title = 'S6A 20210822 Embalse de Yesa (ZP = 8)';
+path_in_FF = 'C:\Users\rmolina\Documents\ProcessingWaterLevel\S6VT_Valeria\processing_wl\gt248\20220328\EmbalseYesa\results\L1B\';
+load('colormap_blues.mat'); % Colormap for radargram plots.
+
+% Approximate latitudes of the target
+target_latitudes = [42.59,42.61];
+
+% Load ML waveforms
+wvf_ML_path = [path_in_FF, 'L1B_FF_ML__20220505T194512__20220507T152834.nc']; % zp 8
+wvf_ML_lat = ncread(wvf_ML_path, 'data/ku/latitude');
+wvf_ML_lon = ncread(wvf_ML_path, 'data/ku/longitude');
+wvf_ML_alt = ncread(wvf_ML_path, 'data/ku/altitude');
+tracker_range_ML = ncread(wvf_ML_path, 'data/ku/tracker_range_calibrated');
+wvf_ML_rawpower = ncread(wvf_ML_path, 'data/ku/power_waveform');
+wvf_ML_scalefactor = ncread(wvf_ML_path, 'data/ku/waveform_scale_factor');
+num_ranges_FF = numel(wvf_ML_rawpower(:,1));
+wvf_ML_power = (wvf_ML_rawpower).*(ones(num_ranges_FF,1)*wvf_ML_scalefactor');
+zp_factor_ML = ncread(wvf_ML_path, '/global/ku/range_oversampling_factor');
+
+% ML waveforms
+bandwidth = 395 * 1e6;
+c = 299792458;
+range_step_ML = c/(2*bandwidth*zp_factor_ML);
+
+% Average (possible since the targets are relatively small) the window center along all the surfaces within the latitude limit. 
+% And, also, establish the conversion window samples --> elevation 
+aux_elev_ML = wvf_ML_alt - tracker_range_ML - geoidheight(wvf_ML_lat, wvf_ML_lon)';
+[auxlat1, auxlat1_idx] = min(abs(target_latitudes(1) - wvf_ML_lat));
+[auxlat1, auxlat2_idx] = min(abs(target_latitudes(2) - wvf_ML_lat));
+if auxlat1_idx < auxlat2_idx
+    elev_ML = aux_elev_ML(auxlat1_idx:auxlat2_idx);
+else
+    elev_ML = aux_elev_ML(auxlat2_idx:auxlat1_idx);
+end
+aux = abs(elev_ML - mean(elev_ML));
+idx_ML = find(aux == min(aux));
+idx_ML = idx_ML(1);
+window_diff = max((max(elev_ML) - mean(elev_ML)),(mean(elev_ML) - min(elev_ML)));
+number_of_windows = ceil(window_diff/(range_step_ML*size(wvf_ML_power,1)));
+top_elev_ML = elev_ML(idx_ML) + (size(wvf_ML_power,1)/2 - 1)*range_step_ML;
+bottom_elev_ML = elev_ML(idx_ML) - (size(wvf_ML_power,1)/2 - 1)*range_step_ML;
+elev_axis_top_elev_ML = elev_ML(idx_ML) + (size(wvf_ML_power,1)/2 - 1)*range_step_ML + number_of_windows*(size(wvf_ML_power,1)-1)*range_step_ML; % delta_x_top = [(N/2-1)*delta + (N-1)*delta]*range_delta
+elev_axis_bot_elev_ML = elev_ML(idx_ML) - (size(wvf_ML_power,1)/2 - 1)*range_step_ML - number_of_windows*(size(wvf_ML_power,1)-1)*range_step_ML;
+elev_axis_ML = (top_elev_ML:-range_step_ML:bottom_elev_ML-range_step_ML);
+
+% Configurable flags for the L2 processing
+enable_plot_wvf = 0; %This plots all the individual fits, used to check the quality of the fits while running some tests.
+enable_wvf_mean_fit = 1; % This will create the Mean Waveform established in the document.
+enable_RMSE_discard = 1; % With this enabled, all the fits with RMSE bigger than RMSE_threshold will be deleted.
+RMSE_threshold = 0.004; % Established empirically while doing the fitting tests.
+RMSE_discarded = 0; % Counter of waveforms discarded due to bad fitting.
+nadir_threshold = 10; % maximum sample distance to be considered nadir (in meters this would be range_step_ML * nadir_threshold)
+% Optimum N samples for fit, assessed during the fitting tests.
+N_opt_right = 1;
+N_opt_left = 1;
+
+vect_ranges_FF = [1:num_ranges_FF];
+all_surfaces = [1:length(tracker_range_ML)];
+num_surfaces_used = 0;
+idx_loop = 1; % auxiliar count for internal computations
+clear useful _surfaces lat_sel_surfaces fit_params_surfaces fit_elev_interp fit_elev_corrected all_fits
+
+% Establish the useful_surfaces vector, with all the surfaces that are contained within the target_latitude paramater
+[aux03, low_lat_water_surface] = min(abs(wvf_ML_lat - target_latitudes(1))); % Select the minimum latitude that can be used as to define the lower water mass margin
+[aux04, high_lat_water_surface] = min(abs(wvf_ML_lat - target_latitudes(2))); % Select the maximum latitude that can be used as to define the higher water mass margin
+if high_lat_water_surface <= low_lat_water_surface
+    useful_surfaces = high_lat_water_surface : low_lat_water_surface; % These are surfaces with water underneath
+else
+    useful_surfaces = low_lat_water_surface : high_lat_water_surface; % These are surfaces with water underneath
+end
+num_surfaces_used = length(useful_surfaces);
+
+% Create the matrix to store the fitting parameters (ampltidue, mean, std)
+fit_params_surfaces = zeros(3, num_surfaces_used); % each row is max amplitude, mean, variance, respectively
+
+% For all the surfaces considered useful, find the peak, establish the fit according to the optimum configurations
+clear lat_sel_surfaces lon_sel_surfaces fit_elev_interp
+for surface_id = useful_surfaces
+    [aux01,wvf_max_idx] = max(wvf_ML_power(:,surface_id)); %Find the maximum peak location
+    % range of samples that will be used for the fit
+    subselection_range_vec{idx_loop} = wvf_max_idx - N_opt_right : wvf_max_idx + N_opt_left;
+    % gaussian fit
+    f = fit(subselection_range_vec{idx_loop}.',wvf_ML_power(subselection_range_vec{idx_loop}, surface_id)/max(wvf_ML_power(subselection_range_vec{idx_loop}, surface_id)),'gauss1');
+    aux_coeff = coeffvalues(f);  
+    for j = 1:length(coeffvalues(f))
+        fit_params_surfaces(j,idx_loop) = aux_coeff(j);
+    end
+    fit_params_surfaces(1,idx_loop) = fit_params_surfaces(1,idx_loop)*max(wvf_ML_power(subselection_range_vec{idx_loop}, surface_id)/max(max(wvf_ML_power(:,useful_surfaces))));
+    lat_sel_surfaces(idx_loop) = wvf_ML_lat(surface_id);
+    lon_sel_surfaces(idx_loop) = wvf_ML_lon(surface_id);
+    fit_elev_interp(idx_loop) = interp1(vect_ranges_FF, elev_axis_ML, fit_params_surfaces(2,idx_loop));
+    % Save this fits for future treatment
+    all_fits{idx_loop} = f; 
+    idx_loop = idx_loop + 1;
+end
+
+
+diff_mean = zeros(1, length(fit_params_surfaces(2,:)));
+idx_loop = 1;
+fit_mean_approx = round(fit_params_surfaces(2,:)); % Approximation of the mean value of the fits
+fit_mean_mode = mode(fit_mean_approx); % Get the mode of the mean value. If some values highly differ from this, false positive
+fit_mean_considered_nadir = (fit_mean_mode - nadir_threshold) : (fit_mean_mode + nadir_threshold);
+
+% Filtering out of the "false detection" waveforms 
+for surface_id = useful_surfaces
+    diff_mean(idx_loop) = abs(fit_mean_mode - fit_params_surfaces(2,idx_loop));
+    if diff_mean(idx_loop) > nadir_threshold
+        fit_elev_interp(idx_loop) = nan;
+        fit_params_surfaces(:,idx_loop) = nan;
+        num_surfaces_used = num_surfaces_used - 1;
+        fit_vs_data{idx_loop} = nan;
+        fit_vs_data_normalized{idx_loop} =  nan; 
+        fit_root_mean_square_error(idx_loop) = nan;
+    else
+        fit_vs_data{idx_loop} = feval(all_fits{idx_loop},subselection_range_vec{idx_loop})*max(wvf_ML_power(subselection_range_vec{idx_loop}, surface_id)/max(max(wvf_ML_power(:,useful_surfaces)))) - wvf_ML_power(subselection_range_vec{idx_loop},surface_id)/max(max(wvf_ML_power(:,useful_surfaces))); 
+        fit_vs_data_normalized{idx_loop} =  fit_vs_data{idx_loop}/max(wvf_ML_power(:,surface_id)/max(max(wvf_ML_power(:,useful_surfaces)))); 
+        fit_root_mean_square_error(idx_loop) = sqrt((sum(fit_vs_data_normalized{idx_loop}.^2))/length(subselection_range_vec{idx_loop}));
+        if enable_RMSE_discard == 1 && fit_root_mean_square_error(idx_loop) > RMSE_threshold % If RMSE bad, ignore the surface
+            fit_vs_data{idx_loop} = nan;
+            fit_vs_data_normalized{idx_loop} =  nan; 
+            fit_root_mean_square_error(idx_loop) = nan;
+            fit_elev_interp(idx_loop) = nan;
+            fit_params_surfaces(:,idx_loop) = nan;
+            num_surfaces_used = num_surfaces_used - 1;
+            RMSE_discarded = RMSE_discarded + 1;           
+        end                  
+    end
+    idx_loop = idx_loop + 1;
+end
+
+mean_altitude = nansum(fit_elev_interp)/num_surfaces_used
+
+if enable_wvf_mean_fit == 1
+    wvf_ML_sum = zeros(length(vect_ranges_FF), 1);
+    for surface_id = useful_surfaces
+        wvf_ML_sum = wvf_ML_sum + wvf_ML_power(:,surface_id);
+    end
+    wvf_ML_mean = wvf_ML_sum/num_surfaces_used;
+    [aux01,wvf_max_idx] = max(wvf_ML_mean); %Find the maximum peak location
+    [aux02,wvf_valley_idx] = findpeaks(-wvf_ML_mean); %Find all the local minimums of the wvf power
+    diff = wvf_valley_idx - wvf_max_idx;
+    diff2 = diff;
+    % find the closest below the maximum
+    diff(diff>=0) = nan; 
+    [~,valley_idx_neg] = max(diff);
+    % find the closest above the maximum
+    diff2(diff2<0) = nan;
+    [~,valley_idx_pos] = min(diff2);
+    % Vector of samples used for the gaussian fit
+    diff_between_max_min_neg = wvf_max_idx - wvf_valley_idx(valley_idx_neg);
+    diff_between_max_min_pos = - wvf_max_idx + wvf_valley_idx(valley_idx_pos);
+    aux_diff_mean = min(diff_between_max_min_pos, diff_between_max_min_neg);
+    subselection_range_vec_mean = wvf_max_idx - 3 : wvf_max_idx + 2;
+    %gaussian fit
+    f = fit(subselection_range_vec_mean.', wvf_ML_mean(subselection_range_vec_mean)/max(wvf_ML_mean), 'gauss1');
+    aux_coeff = coeffvalues(f);
+    x_fit_samples = subselection_range_vec_mean(1) : 0.1 : subselection_range_vec_mean(end);
+    aux_elev_interp = interp1(vect_ranges_FF, elev_axis_ML, x_fit_samples);
+    f_yaxis = feval(f, x_fit_samples);
+    figure(1);
+    plot(aux_elev_interp, f_yaxis);
+    hold on;
+    plot(elev_axis_ML(subselection_range_vec_mean), wvf_ML_mean(subselection_range_vec_mean)/max(wvf_ML_mean),'+');
+    titlestr = sprintf('Mean waveform fit');
+    title(titlestr);
+    xlabel('Water level [m]');
+    ylabel('Mean waveform amplitude normalized');
+    legend('Fitted curve','Data');
+    hold off;
+    fit_vs_data = feval(f,subselection_range_vec_mean) - wvf_ML_mean(subselection_range_vec_mean)/max(wvf_ML_mean);
+    [peak_data, peak_data_elev] = max(wvf_ML_mean(subselection_range_vec_mean)/max(wvf_ML_mean));
+    [peak_fit, peak_fit_elev] = max(f_yaxis);
+    peak_data_elev_mean = elev_axis_ML(subselection_range_vec_mean(peak_data_elev));
+    peak_fit_elev_mean = aux_elev_interp(peak_fit_elev);
+    mean_wvf_elevation = elev_axis_ML(round(aux_coeff(2)));
+    mean_wvf_root_mean_square_error = sqrt((sum(fit_vs_data.^2))/length(subselection_range_vec))
+end
+
+percentage_RMSE_discarded = RMSE_discarded/length(useful_surfaces)*100
+
+%% Geophysical corrections
+% Time Variable Reading
+L2_path_file='C:\Users\rmolina\Documents\ProcessingWaterLevel\S6VT_Valeria\data_wl\gt248\L2\20220328\S6A_P4_2__HR_STD__NT_050_248_20220328T042404_20220328T052017_F05.NC';
+L2_variable_name='/data_20/ku/time_tai';
+L1A_path_file='C:\Users\rmolina\Documents\ProcessingWaterLevel\S6VT_Valeria\data_wl\gt248\L1A\EmbalseYesa\20220328\S6A_P4_1A_HR______20220328T042402_20220328T052019_20220418T181607_3377_050_248_124_EUM__OPE_NT_F05.SEN6_RED.NC';
+L1A_variable_name='data_140/ku/time_tai';
+L2_time_tai=ncread(L2_path_file,L2_variable_name);
+L1A_time_tai=ncread(L1A_path_file,L1A_variable_name)';
+time_ref=posixtime(datetime( 2000,1,1,0,0,0));
+
+% Increase the latitude margins (this is especially needed for small targets since it might be the case that there are no enough samples of geophysical corrections
+% to be interpolated among all the waveforms in the target.
+target_latitudes(1) = target_latitudes(1) - 0.05
+target_latitudes(2) = target_latitudes(2) + 0.05
+
+% Latitude Reading
+L2_variable_name = '/data_20/ku/latitude';
+L2_latitude = ncread(L2_path_file,L2_variable_name);
+
+% Resize the L2 data so that it starts and finishes when the data from the L1A starts/finishes.
+aux = abs(L2_time_tai-L1A_time_tai(1));
+idx1 = find(aux == min(aux));
+aux = abs(L2_time_tai - L1A_time_tai(length(L1A_time_tai)));
+idx2 = find(aux == min(aux));
+L2_time_tai = L2_time_tai(idx1:idx2);
+L2_latitude = L2_latitude(idx1:idx2);
+
+% Geophysical Variables Reading
+L2_dry_tropos_corr_variable_name = 'data_20/ku/model_dry_tropo_cor_measurement_altitude';
+L2_wet_tropos_corr_variable_name = 'data_20/ku/model_wet_tropo_cor_measurement_altitude';
+% Some of the following corrections are not available at the data20,
+% therefore, use the one from the data01 and interpolate it to have the
+% same length than the other corrections
+L2_iono_corr_variable_name = 'data_01/ku/iono_cor_gim';
+L2_load_tide_variable_name = 'data_20/ku/load_tide_sol2';
+L2_sol_earth_tide_variable_name = 'data_01/solid_earth_tide';  
+L2_pole_tide_variable_name = 'data_01/pole_tide'; 
+
+% L2 geo corrections data, as commented above
+L2_dry_tropos_corr = ncread(L2_path_file, L2_dry_tropos_corr_variable_name); 
+L2_wet_tropos_corr = ncread(L2_path_file, L2_wet_tropos_corr_variable_name); 
+L2_iono_corr = ncread(L2_path_file, L2_iono_corr_variable_name);
+data01_length = length(L2_iono_corr);
+data20_length = length(L2_dry_tropos_corr);
+interp_aux = linspace(1,data01_length, data20_length);
+L2_iono_corr_interp = interp1(1:data01_length, L2_iono_corr, interp_aux)';
+L2_load_tide = ncread(L2_path_file,L2_load_tide_variable_name); 
+L2_sol_earth_tide = ncread(L2_path_file,L2_sol_earth_tide_variable_name);
+L2_sol_earth_tide_interp = interp1(1:data01_length, L2_sol_earth_tide, interp_aux)';
+L2_pole_tide = ncread(L2_path_file,L2_pole_tide_variable_name); 
+L2_pole_tide_interp = interp1(1:data01_length, L2_pole_tide, interp_aux)';
+
+% Cut the geo corrections to the study area
+L2_dry_tropos_corr = L2_dry_tropos_corr(idx1:idx2);
+L2_wet_tropos_corr = L2_wet_tropos_corr(idx1:idx2);
+L2_iono_corr_interp = L2_iono_corr_interp(idx1:idx2);
+L2_load_tide = L2_load_tide(idx1:idx2);
+L2_sol_earth_tide_interp = L2_sol_earth_tide_interp(idx1:idx2);
+L2_pole_tide_interp = L2_pole_tide_interp(idx1:idx2);
+
+% Separate the samples that are contained inside the target
+lat_diff_low = abs(L2_latitude - target_latitudes(1));
+lat_diff_up = abs(L2_latitude - target_latitudes(2));
+[~,closest_lat_idx_low] = min(lat_diff_low);
+[~,closest_lat_idx_up] = min(lat_diff_up);
+% If to eliminate possible cases where this deffinition can cause a problem
+if closest_lat_idx_low < closest_lat_idx_up
+    if L2_latitude(closest_lat_idx_low) > target_latitudes(1)
+        closest_lat_idx_low =  closest_lat_idx_low;
+    elseif L2_latitude(closest_lat_idx_up) < target_latitudes(2)
+        closest_lat_idx_up =  closest_lat_idx_up;
+    end
+    target_samples = closest_lat_idx_low:closest_lat_idx_up;
+else
+    if L2_latitude(closest_lat_idx_low) > target_latitudes(1)
+        closest_lat_idx_low =  closest_lat_idx_low;
+    elseif L2_latitude(closest_lat_idx_up) < target_latitudes(2)
+        closest_lat_idx_up =  closest_lat_idx_up;
+    end
+    target_samples = closest_lat_idx_up:closest_lat_idx_low;
+end
+
+% Check times and latitudes of L1A/L2 to ensure everything is ok
+L1A_time_tai = L1A_time_tai(target_samples);
+L2_time_tai = L2_time_tai(target_samples);
+datetime_L2 = datetime(L2_time_tai(1) + time_ref, 'ConvertFrom', 'posixtime')
+datetime_L1A = datetime(L1A_time_tai(1) + time_ref, 'ConvertFrom', 'posixtime')
+
+% With this we know the samples that are contained within the target
+L2_dry_tropos_corr=L2_dry_tropos_corr(target_samples)';
+L2_wet_tropos_corr=L2_wet_tropos_corr(target_samples)';
+L2_iono_corr = L2_iono_corr_interp(target_samples)';
+L2_load_tide = L2_load_tide(target_samples)';
+L2_sol_earth_tide = L2_sol_earth_tide_interp(target_samples)';
+L2_pole_tide = L2_pole_tide_interp(target_samples)'; 
+
+%And lastly, interpolate those corrections to each one of the L1B samples
+L2_dry_tropos_corr_interp = interp1(L2_latitude(target_samples), L2_dry_tropos_corr, lat_sel_surfaces);
+L2_wet_tropos_corr_interp = interp1(L2_latitude(target_samples), L2_wet_tropos_corr, lat_sel_surfaces);
+L2_iono_corr_interp = interp1(L2_latitude(target_samples), L2_iono_corr, lat_sel_surfaces);
+L2_load_tide_interp = interp1(L2_latitude(target_samples), L2_load_tide, lat_sel_surfaces);
+L2_sol_earth_tide_interp = interp1(L2_latitude(target_samples), L2_sol_earth_tide, lat_sel_surfaces);
+L2_pole_tide_interp = interp1(L2_latitude(target_samples), L2_pole_tide, lat_sel_surfaces);
+
+% Geophysical Loses Computation
+geophysical_losses = [L2_dry_tropos_corr_interp',...
+    L2_wet_tropos_corr_interp',...
+    L2_iono_corr_interp',...
+    L2_load_tide_interp',...
+    L2_sol_earth_tide_interp',...
+    L2_pole_tide_interp'];
+geophysical_losses_total = nansum(geophysical_losses,2); % Sum of each row to have the total geo corr of each sample
+mean_geophysical_losses = nanmean(geophysical_losses_total,1)
+geophysical_losses_deglossed = nanmean(geophysical_losses,1) % Mean value of every kind of geophysical loss
+
+fit_elev_corrected = fit_elev_interp - geophysical_losses_total';
+mean_altitude_corrected = nansum(fit_elev_corrected)/(num_surfaces_used)
+
+
+% THE REST OF THE CODE USED FOR PLOTS (TIME SERIES, ERROR ANALYSIS, ETC.) ARE NOT INCLUDED HERE SINCE THEY ARE NOT NECESSARY FOR THE L2 CHAIN
